@@ -91,6 +91,15 @@ in FlashInfer JIT with GPUs at 0% / 15 W while the log repeats
 
 ---
 
+
+**`{"type":"error","error":{"type":"internal_error","message":"glm-5.2 is not a multimodal model"}}`**
+— you pasted an image at a text-only model. Note it is HTTP **500**, not 400, so Claude Code retries and
+the session *hangs* rather than erroring. `/v1/messages` 500s where the OpenAI route cleanly 400s.
+An MCP vision tool cannot fix it (a pasted image is never a tool call) — it has to be handled in the
+proxy. See [docs/CLAUDE-CODE.md](docs/CLAUDE-CODE.md#the-vision-bridge-giving-a-text-only-model-eyes).
+
+---
+
 ## Quickstart
 
 Assumes a working NVIDIA driver, CUDA runtime, and the checkpoint already downloaded. Set these first:

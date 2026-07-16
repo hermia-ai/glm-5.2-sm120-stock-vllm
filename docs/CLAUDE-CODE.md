@@ -70,6 +70,7 @@ curl -s http://$HOST:$PORT/v1/messages/count_tokens \
 | Memory tool (`memory_20250818`) | ❌ HTTP 400 | same cause: server-side tool types aren't recognized |
 | Context editing (`context_management.edits` / `clear_tool_uses_20250919`) | ⚠️ no-op | returns **200** but echoes nothing back; nothing is edited |
 | `cache_control` blocks | ⚠️ silently ignored | accepted, no error, no effect |
+| `image` content blocks | ❌ HTTP **500** | `"glm-5.2 is not a multimodal model"` — the model is text-only. **500 → Claude Code retries → hang.** Fixable in the shim: see [§4 vision bridge](#the-vision-bridge-giving-a-text-only-model-eyes) |
 
 ### On tool search
 
@@ -122,7 +123,7 @@ and you're about to debug the server, check this first.
 
 ## 4. Claude Code cannot talk to vLLM directly — you need a normalizing shim
 
-Claude Code (verified with 2.1.207) sends two things that stock vLLM rejects. Pointing
+Claude Code (verified with 2.1.207) sends three things that stock vLLM rejects. Pointing
 `ANTHROPIC_BASE_URL` straight at vLLM will appear to hang.
 
 ### What breaks
@@ -141,10 +142,29 @@ reasoning_effort error : xhigh, should be no_think/low/high
 Claude Code then retries roughly 8 times. From the UI this is indistinguishable from a
 hang — you see a spinner, not an error.
 
+**(c) An image, if your model is text-only.** GLM-5.2 is text-only. Paste or attach an
+image in Claude Code and it sends a real Anthropic `image` content block:
+
+```
+POST /v1/messages  →  HTTP 500
+{"type":"error","error":{"type":"internal_error","message":"glm-5.2 is not a multimodal model"}}
+```
+
+Note the status. The **OpenAI** route returns a clean `400` for the same input, but
+`/v1/messages` returns **500** — which lands in Claude Code's retry loop and becomes a
+hang, exactly like (b). You get a spinner, not "this model can't see images."
+
+> **An MCP vision tool does not fix this**, and it's worth understanding why before you
+> build one. A `describe_image(path)` MCP tool only helps when the model *chooses to call
+> it* about a file on disk. A **pasted** image is never a tool call — it arrives as an
+> `image` block in `messages[]` and is rejected before the model is invoked at all. The
+> model never gets the chance to route around it. The fix has to sit in the one layer that
+> sees every request: the shim.
+
 ### What the shim must do
 
 Write a small reverse proxy that sits in front of vLLM and normalizes requests. It is
-maybe 100 lines. It must do exactly three things:
+maybe 100 lines (150 with vision). It must do these things:
 
 1. **Hoist non-`user`/`assistant` messages out of `messages[]` into the top-level `system`
    field.** Concatenate onto any existing `system` rather than overwriting it.
@@ -154,6 +174,8 @@ maybe 100 lines. It must do exactly three things:
 3. **Stream responses back as HTTP/1.1 chunked.** If you terminate the response by simply
    closing the connection, Node/undici (which Claude Code uses) treats it as a truncated
    response and retries. Send proper chunked framing and a clean terminating chunk.
+4. **Substitute images with a description** (only if your model is text-only — see the
+   vision bridge below).
 
 Pseudocode for the request path:
 
@@ -201,6 +223,94 @@ Plain Anthropic SDK usage that doesn't do (a) or (b) needs no shim at all — ca
 directly.
 
 ---
+
+
+### The vision bridge: giving a text-only model eyes
+
+If your model is text-only, add a fourth transform. When a request contains an `image`
+block, don't forward it — send the image to *any* multimodal model you can reach, and
+replace the block with the text it returns. The text-only model then receives a normal
+text request and never knows an image was involved.
+
+This works for pasted images, screenshots, drag-and-drop — anything, because it operates
+below the model and requires no cooperation from it.
+
+```python
+VISION_ROUTES = {"my-text-only-route"}      # ONLY these get rewritten
+VISION_URL    = "http://<vision-host>:<port>/v1"   # any OpenAI-shaped multimodal server
+VISION_MODEL  = "<a-multimodal-model>"
+VISION_PROMPT = ("Describe this image thoroughly and objectively. Transcribe any text, "
+                 "code, or error messages verbatim. Note UI layout, diagrams, and data. "
+                 "Be specific: a text-only model will rely entirely on your description.")
+
+def describe(ref: str) -> str | None:
+    """ref is a `data:<mime>;base64,<...>` URI or a plain URL. Returns text, or None."""
+    try:
+        r = post(f"{VISION_URL}/chat/completions", {
+            "model": VISION_MODEL, "max_tokens": 800, "temperature": 0.2,
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": ref}},
+                {"type": "text", "text": VISION_PROMPT}]}],
+        }, timeout=180)
+        return r["choices"][0]["message"]["content"].strip() or None
+    except Exception:
+        return None            # never propagate — see the fallback rule below
+
+def substitute_images(body: dict, route: str) -> dict:
+    if route not in VISION_ROUTES:
+        return body                       # multimodal routes keep their image blocks
+    for m in body.get("messages", []):
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        out = []
+        for b in c:
+            if isinstance(b, dict) and b.get("type") == "image":
+                src = b.get("source") or {}
+                if src.get("type") == "base64":
+                    ref = f"data:{src.get('media_type','image/png')};base64,{src['data']}"
+                elif src.get("type") == "url":
+                    ref = src["url"]
+                else:
+                    ref = None
+                desc = describe(ref) if ref else None
+                out.append({"type": "text", "text":
+                    f"[Image described by {VISION_MODEL}]\n{desc}" if desc else
+                    "[Image omitted: this model is text-only and the vision backend "
+                    "was unavailable. Ask the user to describe it, or retry.]"})
+            else:
+                out.append(b)
+        m["content"] = out
+    return body
+```
+
+**Four rules that matter more than the code:**
+
+1. **Gate it per-route.** Never rewrite images for a route whose model *is* multimodal —
+   you'd be throwing away real image input and replacing it with a lossy paraphrase.
+2. **Never let a vision failure become a 500.** If the vision backend is down, substitute a
+   placeholder string. A placeholder produces a model that says "I can't see the image";
+   a propagated 500 produces a *hang*. The whole point of this transform is removing a
+   hang, so don't reintroduce one on the error path.
+3. **Ship a kill switch** (e.g. `VISION_DISABLE=1`). This runs on every request; you want
+   to turn it off without redeploying.
+4. **Stay byte-identical when there's no image.** Don't re-serialize requests you didn't
+   change — it makes the transform trivially safe to leave on and easy to debug.
+
+**Cost:** one extra round-trip, only when an image is actually present. Measured ~5 s
+end-to-end (vision description + a short GLM-5.2 answer) with a ~35B vision model on a LAN
+host. There's no cost at all on text-only requests.
+
+**Verified:** pasting a solid RGB(0,128,255) PNG at GLM-5.2 through a shim doing exactly
+this returned `HTTP 200` in 4.9 s with `stop_reason: end_turn` and the answer *"The color
+of the image is bright blue."* — from a model that cannot see. The identical request
+without the bridge returns `HTTP 500` and hangs the client.
+
+**What this does *not* replace:** a `describe_image(path)` MCP tool is still worth having.
+It's better when the image is a file on disk the model can reason about deliberately
+("look at ./failing-test.png"), it costs nothing when unused, and the model controls the
+question it asks. The bridge covers the case the tool structurally cannot: an image the
+user pastes.
 
 ## 5. Sampling parameters
 
