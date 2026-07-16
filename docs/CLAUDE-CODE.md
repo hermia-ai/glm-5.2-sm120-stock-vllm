@@ -70,6 +70,8 @@ curl -s http://$HOST:$PORT/v1/messages/count_tokens \
 | Memory tool (`memory_20250818`) | ❌ HTTP 400 | same cause: server-side tool types aren't recognized |
 | Context editing (`context_management.edits` / `clear_tool_uses_20250919`) | ⚠️ no-op | returns **200** but echoes nothing back; nothing is edited |
 | `cache_control` blocks | ⚠️ silently ignored | accepted, no error, no effect |
+| Claude Code **WebSearch** | ❌ HTTP 400 | same `missing input_schema` cause — CC's nested sub-request declares the *server* tool `web_search_20250305`. **400 = 1 attempt, no retry, no hang.** Fixable in the shim: see [§4 web search](#web-search-why-it-400s-and-why-that-is-fine) |
+| Claude Code **WebFetch** | ✅ works | 100% client-side — CC fetches the URL and converts HTML→markdown itself, then asks the model to summarize. No server tool is ever declared. **Don't "fix" it.** |
 | `image` content blocks | ❌ HTTP **500** | `"glm-5.2 is not a multimodal model"` — the model is text-only. **500 → Claude Code retries → hang.** Fixable in the shim: see [§4 vision bridge](#the-vision-bridge-giving-a-text-only-model-eyes) |
 
 ### On tool search
@@ -350,6 +352,83 @@ It's better when the image is a file on disk the model can reason about delibera
 ("look at ./failing-test.png"), it costs nothing when unused, and the model controls the
 question it asks. The bridge covers the case the tool structurally cannot: an image the
 user pastes.
+
+### Web search: why it 400s, and why that is fine
+
+`web_search_20250305` is an Anthropic **server tool**. It has `type` + `name` and **no
+`input_schema`** — so vLLM's `tools[]` model rejects it at body-parse, in about a
+millisecond, before the GPU is touched. Identical cause to the tool-search and memory-tool
+rows above. Version doesn't help: `web_search_20260209` and `web_fetch_20260209` fail the same way.
+
+**The architecture is not what it looks like, and this trips people up.** Claude Code
+(verified on 2.1.207) does *not* put the server tool in your main request:
+
+| Request | What's in `tools[]` | vLLM |
+|---|---|---|
+| **Main** conversation request | `WebSearch` as an ordinary **client** tool, with a valid `input_schema` | ✅ 200 |
+| **Nested sub-request** fired from inside `WebSearch.call()` | the **server** tool `{"type":"web_search_20250305","name":"web_search","max_uses":8}`, `tools:[]`, forced `tool_choice` | ❌ 400 |
+
+So the blast radius is **that one sub-request**, not your whole turn. Your other tools are
+fine. We initially measured this wrong — a synthetic request with a server tool mixed in
+alongside client tools *does* 400 the entire body, which looks like "you lose all tools."
+Real Claude Code never sends that shape.
+
+**Crucially, a 400 does not hang.** Measured against a mock endpoint:
+
+| Status | Claude Code behaviour |
+|---|---|
+| **400** | **exactly 1 attempt**, ~1s, surfaced as `API Error: 400 …` |
+| **500** | ~11 attempts, exponential backoff capped at 32s → **~160s+ stall** |
+
+So the model simply sees the error and falls back to whatever other search tool you've
+given it (an MCP search server, say). **Search still works.** The real cost is one doomed
+round-trip and a red error in the transcript on every search.
+
+> ### ⚠️ Never map an unsupported feature to a 5xx
+> This is the single most important line in this document. That 400 is *load-bearing*. If
+> your proxy "helpfully" rewrites unknown-tool errors to 500, you convert a 1-second
+> graceful failure into a ~3-minute stall. Same for a body containing
+> `"type":"overloaded_error"` or a `x-should-retry: true` header — both get retried
+> **even on a 4xx**. And if a `fallbackModel` is configured, a 400 can *silently switch
+> models* instead of erroring.
+
+**The fix, if you want it clean:** strip `WebSearch` from `tools[]` in your shim **by name**,
+and add a system line pointing the model at your MCP search tool. The model then never calls
+it, the sub-request never fires, and you go straight to a tool that works. Measured on our
+box: **0 × 400, and 21s vs 32s** for the same prompt — a third faster, because the wasted
+round-trip is gone.
+
+```python
+# in normalize_body(), gated to your local routes + a kill switch
+kept = [t for t in j["tools"] if not (isinstance(t, dict) and t.get("name") == "WebSearch")]
+if len(kept) != len(j["tools"]):
+    j["tools"] = kept or None          # avoid tools:[] edge cases
+    tc = j.get("tool_choice")          # never leave a forced choice naming a removed tool
+    if isinstance(tc, dict) and tc.get("type") == "tool" and tc.get("name") == "WebSearch":
+        j["tool_choice"] = {"type": "auto"} if kept else None
+    # + append a system hint naming your MCP search tool (idempotently)
+```
+
+**Strip by NAME — not by "missing `input_schema`".** It is tempting to write the general rule
+"drop any tool without a schema." Don't. That rule fires on the *sub-request*, whose forced
+`tool_choice` still names `web_search` — you get a dangling forced choice, and at best another
+400, at worst a reply with no scrapeable results: **a silent empty search instead of a loud
+error.** Loud beats silent. Let that path keep 400ing; once the name-strip works it is
+unreachable anyway.
+
+**Leave WebFetch alone.** It is entirely client-side and already works on any endpoint. An
+over-broad "strip the web tools" rule breaks something that isn't broken.
+
+**What we deliberately did *not* build:** full server-tool emulation — having the shim run the
+search itself and synthesize `server_tool_use` / `web_search_tool_result` blocks so CC's native
+WebSearch "just works." It's seductive and it's a trap: the shim's response path is an opaque
+byte relay with no SSE producer, the real block shapes are undocumented and we never captured
+them, and the entire payoff is a *label* — the MCP tool already returns correct, cited results.
+If you attempt it anyway, get two measurements first: confirm the sub-request actually sets
+`stream:true`, and capture a real `web_search_tool_result` from `api.anthropic.com`. Without
+both, you're reverse-engineering a wire format into your hot path.
+
+---
 
 ## 5. Sampling parameters
 
