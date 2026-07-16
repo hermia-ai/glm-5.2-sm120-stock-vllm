@@ -1,0 +1,126 @@
+--- orig.py	2026-07-15 16:05:34.818848626 -0700
++++ new.py	2026-07-15 16:05:34.824082827 -0700
+@@ -12,11 +12,13 @@
+     SparseMLAAttentionImpl,
+ )
+ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
++    FlashInferMLASparseImpl,
+     FlashInferMLASparseMetadata,
+     _get_workspace_buffer,
+ )
+ from vllm.v1.attention.backends.mla.sparse_utils import (
+     triton_convert_req_index_to_global_index,
++    triton_filter_and_convert_dcp_index,
+ )
+ 
+ if TYPE_CHECKING:
+@@ -32,6 +34,18 @@
+ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata]):
+     """SM120 FlashInfer sparse-MLA implementation."""
+ 
++    # The SM120 sparse kernel DOES compute and emit the softmax LSE. The GLM
++    # (dsv3_2) path writes per-split mid_lse (decode_dsv3_2_kernel.cuh:652),
++    # then reuses decode-dsv4's merge kernel
++    # (sparse_mla_sm120_decode_dsv3_2.cu:113-121), which writes the final
++    # out_lse at decode_dsv4_kernel.cuh:911-912.
++    can_return_lse_for_decode: bool = True
++    # The kernel emits LSE in LOG2 space, NOT natural log:
++    #   decode_dsv4_kernel.cuh:865  sm_glse = log2f(total_sum) + gmax
++    #   common/online_softmax.cuh:64-66 "Compute LSE ... in log2 space"
++    # so the DCP reducer must use exp2 (ops/common.py:59-64 IS_BASE_E).
++    lse_base_on_e: bool = False
++
+     def __init__(
+         self,
+         num_heads: int,
+@@ -115,19 +129,40 @@
+         assert self.topk_indices_buffer is not None
+         topk_indices = self.topk_indices_buffer[:num_actual_toks]
+ 
+-        topk_indices_physical = cast(
+-            torch.Tensor,
+-            triton_convert_req_index_to_global_index(
++        if self.dcp_world_size > 1:
++            # Each DCP rank owns an interleaved slice of the KV cache: filter
++            # the top-k rows down to this rank's shard and hand the per-row
++            # valid counts to the kernel as seq_lens (topk_length).
++            topk_indices_physical, seq_lens = triton_filter_and_convert_dcp_index(
+                 attn_metadata.req_id_per_token[:num_actual_toks],
+                 attn_metadata.block_table,
+                 topk_indices,
++                dcp_size=self.dcp_world_size,
++                dcp_rank=self.dcp_rank,
++                cp_kv_cache_interleave_size=(
++                    attn_metadata.cp_kv_cache_interleave_size
++                ),
+                 BLOCK_SIZE=attn_metadata.block_size,
+                 NUM_TOPK_TOKENS=topk_indices.shape[1],
+-            ),
+-        )
++                return_valid_counts=True,
++            )
++        else:
++            topk_indices_physical, seq_lens = triton_convert_req_index_to_global_index(
++                attn_metadata.req_id_per_token[:num_actual_toks],
++                attn_metadata.block_table,
++                topk_indices,
++                BLOCK_SIZE=attn_metadata.block_size,
++                NUM_TOPK_TOKENS=topk_indices.shape[1],
++                return_valid_counts=True,
++            )
+ 
++        # Under DCP the q heads are all-gathered across the DCP group before
++        # forward_mqa (mla_attention.py:807), so the kernel sees
++        # dcp_world_size * self.num_heads. Size the output from the ACTUAL
++        # tensor, never from self.num_heads.
++        num_query_heads = q.shape[1]
+         output = q.new_empty(
+-            (num_actual_toks, self.num_heads, self.kv_lora_rank),
++            (num_actual_toks, num_query_heads, self.kv_lora_rank),
+             dtype=q.dtype,
+         )
+ 
+@@ -138,7 +173,7 @@
+             flashinfer_trtllm_batch_decode_with_kv_cache_mla,
+         )
+ 
+-        out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
++        kernel_out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
+             query=q.unsqueeze(1),
+             kv_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(1),
+             workspace_buffer=self._workspace_buffer,
+@@ -146,12 +181,32 @@
+             kv_lora_rank=self.kv_lora_rank,
+             qk_rope_head_dim=self.qk_rope_head_dim,
+             block_tables=topk_indices_physical.unsqueeze(1),
+-            seq_lens=None,
++            seq_lens=seq_lens,
+             max_seq_len=attn_metadata.topk_tokens,
+             out=output.unsqueeze(1),
+             bmm1_scale=self.scale,
+             bmm2_scale=1.0,
+             sparse_mla_top_k=attn_metadata.topk_tokens,
+             kv_scale_format=self.kv_scale_format,
++            return_lse=self.need_to_return_lse_for_decode,
+         )
+-        return out.squeeze(1), None
++        if self.need_to_return_lse_for_decode:
++            assert isinstance(kernel_out, tuple)
++            o, lse = kernel_out
++        else:
++            o = cast(torch.Tensor, kernel_out)
++            lse = None
++
++        out = o.squeeze(1)
++        if lse is None:
++            return out, None
++
++        # The shared DCP reducer (cp_lse_ag_out_rs / dcp_a2a_lse_reduce) wants
++        # (num_tokens, num_heads) float32. Reuse the sibling's normalizer.
++        lse = FlashInferMLASparseImpl._normalize_lse(lse, out.shape[0], out.shape[1])
++        # Rows whose top-k set is empty on this rank must not contribute to the
++        # cross-rank softmax denominator.
++        empty_rows = (topk_indices_physical == -1).all(dim=-1)
++        out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
++        lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
++        return out, lse

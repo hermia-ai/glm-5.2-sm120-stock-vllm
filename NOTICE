@@ -1,0 +1,23 @@
+glm-5.2-sm120-stock-vllm
+Copyright 2026 hermia-ai
+
+This product includes software derived from the vLLM project
+(https://github.com/vllm-project/vllm), licensed under the Apache License 2.0.
+
+The DCP (decode context parallelism) patch in patches/ is a derivative work of
+vLLM's vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py and is an
+independent reimplementation of the approach in vLLM PR #47779
+(https://github.com/vllm-project/vllm/pull/47779), authored upstream and not by
+this project. Credit for the design belongs to that PR's author. This repository
+contributes independent validation on sm_120 hardware, not novel design.
+
+Prior art and thanks:
+  - vLLM PR #47779 — the upstream DCP/LSE fix this patch reimplements.
+  - DeepGEMM PR #324 (NVIDIA DevTech APAC) — added sm120_fp4_mqa_logits, which
+    unblocked GLM-5.2's DSA indexer on sm_120.
+  - FlashInfer PR #3395 — SM120 sparse MLA kernels.
+  - 0xSero — the REAP-pruned NVFP4 checkpoint and the glm-5.2-sm120 fork/Docker
+    recipe (https://github.com/0xSero/glm-5.2-sm120), which documents the
+    B12X_MLA_SPARSE path. This repository documents the complementary
+    stock-vLLM path.
+  - lukealonso/b12x — SM120 NVFP4 kernels.
