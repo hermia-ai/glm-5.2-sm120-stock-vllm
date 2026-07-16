@@ -119,6 +119,45 @@ reasoning stream, and it ran until the cap cut it off before any `text` block ev
 **Rule: set `max_tokens >= 1024` for every request.** If your client returns empty strings
 and you're about to debug the server, check this first.
 
+### The general form of this bug (it will bite you twice)
+
+This is not a GLM quirk — it is what **any** `--reasoning-parser` does. The parser strips
+thinking out of `content`. So when a reasoning model runs out of budget while still thinking:
+
+> **a too-small `max_tokens` produces EMPTY output, not truncated output.**
+
+There is no error, no warning, and `reasoning_content` is often not populated either — you
+get `finish_reason: "length"` and `content: ""`. Every downstream layer then misreports it
+as something else entirely: a proxy sees "no description", a client sees "the model refused",
+a user sees *"I can't see the image"*.
+
+**We shipped this bug ourselves.** The vision bridge in §5 below called a reasoning-enabled
+vision model with `max_tokens: 800`. Small test images with a short prompt fit the budget and
+passed. Real screenshots with the real (thorough) prompt did not — the model thought past 800,
+returned empty content, the bridge substituted its "backend unavailable" placeholder, and the
+text-only model dutifully told the user it couldn't see the image. The bridge had run
+*correctly* and logged success. **The whole failure was 800 vs 2000 tokens.**
+
+Two defences, use both:
+
+```jsonc
+{
+  "chat_template_kwargs": {"enable_thinking": false},  // thinking off where you don't need it:
+                                                       // measured 603 -> 155 completion tokens
+  "max_tokens": 2000                                   // and a budget well clear of the cap
+}
+```
+
+And log `finish_reason` whenever you get empty content — `length` names this bug instantly:
+
+```python
+if not txt:
+    log("empty content; finish=%s" % choice.get("finish_reason"))   # "length" == this bug
+```
+
+**Diagnostic tell:** if it works on your small test fixture and fails on real input, suspect
+the token budget before you suspect the model. Test with the *real* prompt, not a short one.
+
 ---
 
 ## 4. Claude Code cannot talk to vLLM directly — you need a normalizing shim
